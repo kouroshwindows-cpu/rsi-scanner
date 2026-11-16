@@ -1,16 +1,18 @@
 import requests
 import pandas as pd
 import time
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from prefect import flow, get_run_logger
 
 RSI_PERIOD = 14
 RSI_LEVEL = 47
 RSI_LEVEL_30 = 30
 NOBITEX_BASE = "https://apiv2.nobitex.ir"
-HEADERS = {"User-Agent": "TraderBot/RSI-Scanner-1.3"}
+HEADERS = {"User-Agent": "TraderBot/RSI-Scanner-1.4"}
 
 SYMBOLS = ["PAXGUSDT", "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "GRAMUSDT"]
+
+IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 
 
 def get_closes(symbol, resolution, limit=500):
@@ -26,11 +28,11 @@ def get_closes(symbol, resolution, limit=500):
         "from": start, "to": now, "countback": limit,
     }
 
-    for attempt in range(3):
+    for attempt in range(2):
         try:
-            resp = requests.get(url, params=params, headers=HEADERS, timeout=20)
+            resp = requests.get(url, params=params, headers=HEADERS, timeout=8)
             if resp.status_code == 429:
-                time.sleep(10)
+                time.sleep(3)
                 continue
             data = resp.json()
             if data.get("s") != "ok":
@@ -41,7 +43,7 @@ def get_closes(symbol, resolution, limit=500):
                 return None, None
             return pd.Series([float(c) for c in closes]), timestamps
         except Exception:
-            time.sleep(2)
+            time.sleep(1)
     return None, None
 
 
@@ -59,13 +61,8 @@ def calculate_rsi(closes, period=14):
     return rsi
 
 
-def find_crosses_last_12h(rsi_series, timestamps, level, resolution):
-    """
-    همه کراس‌های صعودی از سطح در ۱۲ ساعت گذشته را پیدا می‌کند
-    (شامل کندل ناقص جاری).
-    برمی‌گرداند: (crossed: bool, latest_cross_time: str or None,
-                   curr_rsi: float, prev_rsi: float, cross_count: int)
-    """
+def find_crosses_last_12h(rsi_series, timestamps, level):
+    """همه کراس‌های صعودی از سطح در ۱۲ ساعت گذشته (شامل کندل ناقص جاری)"""
     if rsi_series is None or len(rsi_series) < 2:
         return None, None, None, None, 0
 
@@ -74,16 +71,14 @@ def find_crosses_last_12h(rsi_series, timestamps, level, resolution):
     cross_count = 0
 
     for i in range(1, len(rsi_series)):
-        # timestamp کندل i
         ts = timestamps[i]
-        # فقط کراس‌هایی که در ۱۲ ساعت گذشته رخ داده‌اند
         if ts < cutoff:
             continue
         prev_rsi = float(rsi_series.iloc[i - 1])
         curr_rsi = float(rsi_series.iloc[i])
         if prev_rsi < level <= curr_rsi:
             cross_count += 1
-            latest_cross_time = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+            latest_cross_time = datetime.fromtimestamp(ts, tz=IRAN_TZ).strftime("%Y-%m-%d %H:%M")
 
     curr_rsi = float(rsi_series.iloc[-1])
     prev_rsi = float(rsi_series.iloc[-2])
@@ -91,55 +86,65 @@ def find_crosses_last_12h(rsi_series, timestamps, level, resolution):
     return crossed, latest_cross_time, curr_rsi, prev_rsi, cross_count
 
 
-def format_line(base, crossed, curr_rsi, prev_rsi, cross_time, cross_count, resolution):
-    """قالب‌بندی یک خط خروجی"""
-    tf = "12H" if resolution == "720" else "6H"
+def format_line(base, crossed, curr_rsi, prev_rsi, cross_time, cross_count):
+    """قالب‌بندی یک خط خروجی مثل قبل"""
     if crossed is None:
         return f"  {base:<6} | data unavailable\n"
     if crossed:
-        return (f"  {base:<6} | {tf} RSI: {curr_rsi:6.2f} (prev {prev_rsi:6.2f}) | "
+        return (f"  {base:<6} | RSI: {curr_rsi:6.2f} (prev {prev_rsi:6.2f}) | "
                 f"✅ {cross_count} cross(es) in last 12h, latest: {cross_time}\n")
-    return (f"  {base:<6} | {tf} RSI: {curr_rsi:6.2f} (prev {prev_rsi:6.2f}) | "
+    return (f"  {base:<6} | RSI: {curr_rsi:6.2f} (prev {prev_rsi:6.2f}) | "
             f"❌ no cross in last 12h\n")
 
 
-def emit_block(logger, title, resolution, level):
-    """چاپ یک بلوک کامل - فقط روی همان تایم‌فریم"""
-    logger.info(f"\n{title}")
-    logger.info("-" * 55)
+def fetch_tf_data(resolution):
+    """داده همه نمادها برای یک تایم‌فریم رو یک بار می‌گیره و RSI حساب می‌کنه"""
+    data = {}
     for sym in SYMBOLS:
         base = sym.replace("USDT", "")
         closes, timestamps = get_closes(sym, resolution)
         if closes is None:
-            logger.info(f"  {base:<6} | data unavailable")
+            data[sym] = (base, None, None)
             continue
         rsi = calculate_rsi(closes).dropna()
         valid_ts = timestamps[-len(rsi):]
+        data[sym] = (base, rsi, valid_ts)
+    return data
+
+
+def emit_block(logger, title, tf_data, level):
+    """چاپ یک بلوک کامل از داده‌ای که قبلاً گرفته شده"""
+    logger.info(f"\n{title}")
+    logger.info("-" * 55)
+    for sym in SYMBOLS:
+        base, rsi, valid_ts = tf_data[sym]
+        if rsi is None:
+            logger.info(f"  {base:<6} | data unavailable")
+            continue
         crossed, cross_time, curr_rsi, prev_rsi, cross_count = find_crosses_last_12h(
-            rsi, valid_ts, level, resolution
+            rsi, valid_ts, level
         )
-        logger.info(format_line(base, crossed, curr_rsi, prev_rsi, cross_time, cross_count, resolution))
+        logger.info(format_line(base, crossed, curr_rsi, prev_rsi, cross_time, cross_count))
 
 
 @flow(log_prints=True)
 def run_scan():
     logger = get_run_logger()
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now_str = datetime.now(IRAN_TZ).strftime("%Y-%m-%d %H:%M:%S")
     logger.info("=" * 55)
-    logger.info(f"RSI Cross Scanner | {now_str}")
+    logger.info(f"RSI Cross Scanner | {now_str} (Iran Time)")
     logger.info("=" * 55)
 
-    # بلوک ۱: 12H RSI > 47 — فقط روی 12H
-    emit_block(logger, "[Block 1] 12H RSI crossed above 47 (last 12h, may be unclosed)", "720", RSI_LEVEL)
+    # داده ۱۲ ساعته رو یک بار بگیر
+    data_12h = fetch_tf_data("720")
+    # داده ۶ ساعته رو یک بار بگیر
+    data_6h = fetch_tf_data("360")
 
-    # بلوک ۲: 12H RSI > 30 — فقط روی 12H
-    emit_block(logger, "[Block 2] 12H RSI crossed above 30 (last 12h, may be unclosed)", "720", RSI_LEVEL_30)
-
-    # بلوک ۳: 6H RSI > 47 — فقط روی 6H
-    emit_block(logger, "[Block 3] 6H RSI crossed above 47 (last 12h, may be unclosed)", "360", RSI_LEVEL)
-
-    # بلوک ۴: 6H RSI > 30 — فقط روی 6H
-    emit_block(logger, "[Block 4] 6H RSI crossed above 30 (last 12h, may be unclosed)", "360", RSI_LEVEL_30)
+    # حالا ۴ بلوک جدا مثل قبل چاپ کن (بدون درخواست اضافه)
+    emit_block(logger, "[Block 1] 12H RSI crossed above 47 (last 12h, may be unclosed)", data_12h, RSI_LEVEL)
+    emit_block(logger, "[Block 2] 12H RSI crossed above 30 (last 12h, may be unclosed)", data_12h, RSI_LEVEL_30)
+    emit_block(logger, "[Block 3] 6H RSI crossed above 47 (last 12h, may be unclosed)", data_6h, RSI_LEVEL)
+    emit_block(logger, "[Block 4] 6H RSI crossed above 30 (last 12h, may be unclosed)", data_6h, RSI_LEVEL_30)
 
     logger.info("\nScan completed.")
 
