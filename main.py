@@ -28,11 +28,11 @@ def get_closes(symbol, resolution, limit=500):
         "from": start, "to": now, "countback": limit,
     }
 
-    for attempt in range(2):
+    for attempt in range(3):
         try:
-            resp = requests.get(url, params=params, headers=HEADERS, timeout=8)
+            resp = requests.get(url, params=params, headers=HEADERS, timeout=10)
             if resp.status_code == 429:
-                time.sleep(3)
+                time.sleep(2)
                 continue
             data = resp.json()
             if data.get("s") != "ok":
@@ -140,7 +140,7 @@ def run_scan():
     # داده ۶ ساعته رو یک بار بگیر
     data_6h = fetch_tf_data("360")
 
-    # حالا ۴ بلوک جدا مثل قبل چاپ کن (بدون درخواست اضافه)
+    # ۴ بلوک جدا مثل قبل (بدون درخواست اضافه)
     emit_block(logger, "[Block 1] 12H RSI crossed above 47 (last 12h, may be unclosed)", data_12h, RSI_LEVEL)
     emit_block(logger, "[Block 2] 12H RSI crossed above 30 (last 12h, may be unclosed)", data_12h, RSI_LEVEL_30)
     emit_block(logger, "[Block 3] 6H RSI crossed above 47 (last 12h, may be unclosed)", data_6h, RSI_LEVEL)
