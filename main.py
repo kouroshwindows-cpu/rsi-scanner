@@ -1,13 +1,12 @@
 import requests
 import pandas as pd
 import time
-import json
 from datetime import datetime, timezone, timedelta
 from prefect import flow, get_run_logger
 
 RSI_PERIOD = 14
 NOBITEX_BASE = "https://apiv2.nobitex.ir"
-HEADERS = {"User-Agent": "TraderBot/RSI-Scanner-2.4"}
+HEADERS = {"User-Agent": "TraderBot/RSI-Scanner-2.5"}
 
 IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 
@@ -33,6 +32,8 @@ def get_closes(symbol, resolution, limit=500):
     url = f"{NOBITEX_BASE}/market/udf/history"
     now = int(time.time())
     seconds_per_candle = 360 if resolution == "360" else 720
+    if resolution == "60":
+        seconds_per_candle = 60
     aligned_now = (now // seconds_per_candle) * seconds_per_candle
     start = aligned_now - (limit - 1) * seconds_per_candle
 
@@ -53,7 +54,6 @@ def get_closes(symbol, resolution, limit=500):
             data = resp.json()
             s = data.get("s")
 
-            # نوبیتکس صریحاً no_data برمی‌گرداند [citation:4]
             if s == "no_data":
                 print(f"[{symbol} {resolution}] NO_DATA: no candles in this range")
                 return None, None
@@ -102,8 +102,10 @@ def calculate_rsi(closes, period=14):
     avg_loss = loss.iloc[1:period + 1].mean()
 
     def _rsi(ag, al):
-        if al == 0: return 100.0
-        if ag == 0: return 0.0
+        if al == 0:
+            return 100.0
+        if ag == 0:
+            return 0.0
         return 100.0 - (100.0 / (1.0 + ag / al))
 
     rsi.iloc[period] = _rsi(avg_gain, avg_loss)
@@ -184,15 +186,17 @@ def fetch_tf_data(symbols, resolution):
     return data
 
 
-def emit_asset_block(logger, title, symbol, levels, data_12h, data_6h):
+def emit_asset_block(logger, title, symbol, levels, data_12h, data_6h, data_1h):
     logger.info(f"\n{title}")
     logger.info("-" * 70)
 
-    rsi_live, _ = data_12h.get(symbol, {}).get("live", (None, None))
-    if rsi_live is not None and len(rsi_live.dropna()) > 0:
-        logger.info(f"  RSI (live): {float(rsi_live.dropna().iloc[-1]):.2f}")
-    else:
-        logger.info("  RSI (live): unavailable")
+    for tf_name, source in [("12h", data_12h), ("6h", data_6h), ("1h", data_1h)]:
+        rsi_live, _ = source.get(symbol, {}).get("live", (None, None))
+        if rsi_live is not None and len(rsi_live.dropna()) > 0:
+            logger.info(f"  RSI (live, {tf_name}): {float(rsi_live.dropna().iloc[-1]):.2f}")
+        else:
+            logger.info(f"  RSI (live, {tf_name}): unavailable")
+
     logger.info("")
 
     for level, resolution, tf_label in levels:
@@ -211,16 +215,21 @@ def run_scan():
     logger = get_run_logger()
     now_str = datetime.now(IRAN_TZ).strftime("%Y-%m-%d %H:%M:%S")
     logger.info("=" * 70)
-    logger.info(f"RSI Cross Scanner v2.4 | {now_str} (Iran Time)")
+    logger.info(f"RSI Cross Scanner v2.5 | {now_str} (Iran Time)")
     logger.info("=" * 70)
 
     all_symbols = [GOLD_SYMBOL] + OTHER_SYMBOLS
+
     data_12h = fetch_tf_data(all_symbols, "720")
     data_6h = fetch_tf_data(all_symbols, "360")
+    data_1h = fetch_tf_data(all_symbols, "60")
 
-    emit_asset_block(logger, "[Block 1] PAXG (Gold)", GOLD_SYMBOL, GOLD_LEVELS, data_12h, data_6h)
+    emit_asset_block(logger, "[Block 1] PAXG (Gold)", GOLD_SYMBOL, GOLD_LEVELS, data_12h, data_6h, data_1h)
+
     for idx, sym in enumerate(OTHER_SYMBOLS, start=2):
-        emit_asset_block(logger, f"[Block {idx}] {sym.replace('USDT','')}", sym, OTHER_LEVELS, data_12h, data_6h)
+        emit_asset_block(
+            logger, f"[Block {idx}] {sym.replace('USDT', '')}", sym, OTHER_LEVELS, data_12h, data_6h, data_1h
+        )
 
     logger.info("\nScan completed.")
 
