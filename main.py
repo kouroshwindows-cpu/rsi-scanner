@@ -50,6 +50,7 @@ def get_closes(symbol, resolution, limit=500):
             if not closes or len(closes) < RSI_PERIOD + 3:
                 return None, None
 
+            # حذف آخرین کندل ناقص
             closes = closes[:-1]
             timestamps = timestamps[:-1]
 
@@ -64,32 +65,48 @@ def get_closes(symbol, resolution, limit=500):
 
 
 def calculate_rsi(closes, period=14):
+    """
+    Wilder's RSI مطابق TradingView:
+    - Seed: میانگین ساده ۱۴ دلتای اول
+    - سپس: avg = (prev_avg * (period-1) + current) / period
+    - حداقل ۱۰۰ کندل برای پایداری توصیه می‌شود
+    """
     closes = pd.Series(closes).astype(float).reset_index(drop=True)
     delta = closes.diff()
+
     gain = delta.clip(lower=0.0)
     loss = (-delta).clip(lower=0.0)
 
     n = len(closes)
-    avg_gain = pd.Series([float("nan")] * n, dtype=float)
-    avg_loss = pd.Series([float("nan")] * n, dtype=float)
+    rsi = pd.Series([float("nan")] * n, dtype=float)
 
     if n <= period:
-        return 100.0 - (100.0 / (1.0 + (avg_gain / avg_loss)))
+        return rsi
 
+    # Seed: میانگین ساده period دلتای اول (ایندکس ۱ تا period)
     seed_gain = gain.iloc[1:period + 1].mean()
     seed_loss = loss.iloc[1:period + 1].mean()
-    avg_gain.iloc[period] = seed_gain
-    avg_loss.iloc[period] = seed_loss
 
+    avg_gain = seed_gain
+    avg_loss = seed_loss
+
+    def _calc_rsi(ag, al):
+        if al == 0:
+            return 100.0
+        if ag == 0:
+            return 0.0
+        rs = ag / al
+        return 100.0 - (100.0 / (1.0 + rs))
+
+    # اولین RSI در ایندکس period
+    rsi.iloc[period] = _calc_rsi(avg_gain, avg_loss)
+
+    # دوره‌های بعدی با平滑 سازی Wilder
     for i in range(period + 1, n):
-        avg_gain.iloc[i] = (avg_gain.iloc[i - 1] * (period - 1) + gain.iloc[i]) / period
-        avg_loss.iloc[i] = (avg_loss.iloc[i - 1] * (period - 1) + loss.iloc[i]) / period
+        avg_gain = (avg_gain * (period - 1) + gain.iloc[i]) / period
+        avg_loss = (avg_loss * (period - 1) + loss.iloc[i]) / period
+        rsi.iloc[i] = _calc_rsi(avg_gain, avg_loss)
 
-    rs = avg_gain / avg_loss
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    rsi = rsi.where(avg_loss != 0, 100.0)
-    rsi = rsi.where(avg_gain != 0, 0.0)
-    rsi.iloc[:period] = float("nan")
     return rsi
 
 
