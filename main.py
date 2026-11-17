@@ -25,6 +25,10 @@ MAX_RETRIES = 5
 
 
 def get_closes(symbol, resolution, limit=500):
+    """
+    Returns (closes, timestamps) INCLUDING the current forming candle.
+    The caller decides whether to drop it.
+    """
     url = f"{NOBITEX_BASE}/market/udf/history"
     now = int(time.time())
     seconds_per_candle = 360 if resolution == "360" else 720
@@ -50,13 +54,7 @@ def get_closes(symbol, resolution, limit=500):
             if not closes or len(closes) < RSI_PERIOD + 3:
                 return None, None
 
-            # حذف آخرین کندل ناقص
-            closes = closes[:-1]
-            timestamps = timestamps[:-1]
-
-            if len(closes) < RSI_PERIOD + 2:
-                return None, None
-
+            # داده کامل برمی‌گردانیم، شامل کندل ناقص
             return pd.Series([float(c) for c in closes]), timestamps
         except Exception:
             time.sleep(1 + attempt)
@@ -65,12 +63,7 @@ def get_closes(symbol, resolution, limit=500):
 
 
 def calculate_rsi(closes, period=14):
-    """
-    Wilder's RSI مطابق TradingView:
-    - Seed: میانگین ساده ۱۴ دلتای اول
-    - سپس: avg = (prev_avg * (period-1) + current) / period
-    - حداقل ۱۰۰ کندل برای پایداری توصیه می‌شود
-    """
+    """Wilder's RSI matching TradingView."""
     closes = pd.Series(closes).astype(float).reset_index(drop=True)
     delta = closes.diff()
 
@@ -83,14 +76,10 @@ def calculate_rsi(closes, period=14):
     if n <= period:
         return rsi
 
-    # Seed: میانگین ساده period دلتای اول (ایندکس ۱ تا period)
-    seed_gain = gain.iloc[1:period + 1].mean()
-    seed_loss = loss.iloc[1:period + 1].mean()
+    avg_gain = gain.iloc[1:period + 1].mean()
+    avg_loss = loss.iloc[1:period + 1].mean()
 
-    avg_gain = seed_gain
-    avg_loss = seed_loss
-
-    def _calc_rsi(ag, al):
+    def _rsi(ag, al):
         if al == 0:
             return 100.0
         if ag == 0:
@@ -98,16 +87,31 @@ def calculate_rsi(closes, period=14):
         rs = ag / al
         return 100.0 - (100.0 / (1.0 + rs))
 
-    # اولین RSI در ایندکس period
-    rsi.iloc[period] = _calc_rsi(avg_gain, avg_loss)
-
-    # دوره‌های بعدی با平滑 سازی Wilder
+    rsi.iloc[period] = _rsi(avg_gain, avg_loss)
     for i in range(period + 1, n):
         avg_gain = (avg_gain * (period - 1) + gain.iloc[i]) / period
         avg_loss = (avg_loss * (period - 1) + loss.iloc[i]) / period
-        rsi.iloc[i] = _calc_rsi(avg_gain, avg_loss)
+        rsi.iloc[i] = _rsi(avg_gain, avg_loss)
 
     return rsi
+
+
+def build_two_series(closes, timestamps):
+    """
+    Returns:
+      rsi_live: RSI INCLUDING the current forming candle (for display)
+      rsi_closed: RSI EXCLUDING the current forming candle (for cross detection)
+      ts_closed: timestamps aligned with rsi_closed
+    """
+    rsi_live = calculate_rsi(closes)
+    ts_live = list(timestamps)
+
+    # برای کراس: کندل آخر (ناقص) حذف می‌شود
+    closes_closed = closes.iloc[:-1].reset_index(drop=True)
+    ts_closed = list(timestamps[:-1])
+    rsi_closed = calculate_rsi(closes_closed)
+
+    return rsi_live, ts_live, rsi_closed, ts_closed
 
 
 def find_crosses_last_12h(rsi_series, timestamps, level):
@@ -161,24 +165,34 @@ def format_check(level, tf_label, last_closed_cross, curr_rsi, cross_count, n_cl
     if curr_rsi is None:
         return f"    ❌ cross {level} ({tf_label}): data unavailable\n"
     if last_closed_cross:
-        return (f"    ✅ cross {level} ({tf_label}): READY (RSI {curr_rsi:.2f}) "
+        return (f"    ✅ cross {level} ({tf_label}): READY "
                 f"| last closed cross: {last_closed_cross} | count(12h): {cross_count}\n")
     warn = ""
     if n_closed < MIN_STABLE_CANDLES:
         warn = f" [warn: only {n_closed} closed candles]"
-    return (f"    ❌ cross {level} ({tf_label}): no cross in last 12h "
-            f"(RSI {curr_rsi:.2f}){warn}\n")
+    return (f"    ❌ cross {level} ({tf_label}): no cross in last 12h"
+            f"{warn}\n")
 
 
 def fetch_tf_data(symbols, resolution):
+    """
+    Returns dict:
+      sym -> {
+        'live': (rsi_live, ts_live),
+        'closed': (rsi_closed, ts_closed),
+      }
+    """
     data = {}
     for sym in symbols:
         closes, timestamps = get_closes(sym, resolution)
         if closes is None:
-            data[sym] = (None, None)
+            data[sym] = {"live": (None, None), "closed": (None, None)}
             continue
-        rsi = calculate_rsi(closes)
-        data[sym] = (rsi, timestamps)
+        rsi_live, ts_live, rsi_closed, ts_closed = build_two_series(closes, timestamps)
+        data[sym] = {
+            "live": (rsi_live, ts_live),
+            "closed": (rsi_closed, ts_closed),
+        }
     return data
 
 
@@ -186,24 +200,25 @@ def emit_asset_block(logger, title, symbol, levels, data_12h, data_6h):
     logger.info(f"\n{title}")
     logger.info("-" * 70)
 
-    rsi_12h, _ = data_12h.get(symbol, (None, None))
-    if rsi_12h is not None and len(rsi_12h.dropna()) > 0:
-        logger.info(f"  RSI (last closed 12h candle): {float(rsi_12h.dropna().iloc[-1]):.2f}")
+    # RSI لحظه‌ای: از سری live (شامل کندل ناقص)
+    rsi_live_12h, _ = data_12h.get(symbol, {}).get("live", (None, None))
+    if rsi_live_12h is not None and len(rsi_live_12h.dropna()) > 0:
+        logger.info(f"  RSI (live): {float(rsi_live_12h.dropna().iloc[-1]):.2f}")
     else:
-        logger.info("  RSI (last closed 12h candle): data unavailable")
+        logger.info("  RSI (live): data unavailable")
     logger.info("")
 
     for level, resolution, tf_label in levels:
         source = data_12h if resolution == "720" else data_6h
-        rsi, valid_ts = source.get(symbol, (None, None))
-        if rsi is None:
+        rsi_closed, ts_closed = source.get(symbol, {}).get("closed", (None, None))
+        if rsi_closed is None:
             logger.info(f"    ❌ cross {level} ({tf_label}): data unavailable")
             continue
-        n_closed = int(rsi.notna().sum())
-        last_closed_cross, _, curr_rsi, prev_rsi, cross_count = find_crosses_last_12h(
-            rsi, valid_ts, level
+        n_closed = int(rsi_closed.notna().sum())
+        last_closed_cross, _, _, _, cross_count = find_crosses_last_12h(
+            rsi_closed, ts_closed, level
         )
-        logger.info(format_check(level, tf_label, last_closed_cross, curr_rsi, cross_count, n_closed))
+        logger.info(format_check(level, tf_label, last_closed_cross, None, cross_count, n_closed))
 
 
 @flow(log_prints=True)
@@ -211,7 +226,7 @@ def run_scan():
     logger = get_run_logger()
     now_str = datetime.now(IRAN_TZ).strftime("%Y-%m-%d %H:%M:%S")
     logger.info("=" * 70)
-    logger.info(f"RSI Cross Scanner v2.2 | {now_str} (Iran Time)")
+    logger.info(f"RSI Cross Scanner v2.3 | {now_str} (Iran Time)")
     logger.info("=" * 70)
 
     all_symbols = [GOLD_SYMBOL] + OTHER_SYMBOLS
